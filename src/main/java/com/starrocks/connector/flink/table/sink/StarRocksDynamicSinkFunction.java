@@ -43,6 +43,7 @@ import org.apache.flink.types.RowKind;
 import org.apache.flink.util.InstantiationUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import scala.Tuple3;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -66,11 +67,14 @@ public class StarRocksDynamicSinkFunction<T> extends StarRocksDynamicSinkFunctio
 
     public StarRocksDynamicSinkFunction(StarRocksSinkOptions sinkOptions, TableSchema schema, StarRocksIRowTransformer<T> rowTransformer) {
         StarRocksJdbcConnectionOptions jdbcOptions = new StarRocksJdbcConnectionOptions(sinkOptions.getJdbcUrl(), sinkOptions.getUsername(), sinkOptions.getPassword());
+       //jdbc 客户端
         StarRocksJdbcConnectionProvider jdbcConnProvider = new StarRocksJdbcConnectionProvider(jdbcOptions);
         StarRocksQueryVisitor starrocksQueryVisitor = new StarRocksQueryVisitor(jdbcConnProvider, sinkOptions.getDatabaseName(), sinkOptions.getTableName());
         this.sinkManager = new StarRocksSinkManager(sinkOptions, schema, jdbcConnProvider, starrocksQueryVisitor);
 
+        //获取事实表字段mapping
         rowTransformer.setStarRocksColumns(starrocksQueryVisitor.getFieldMapping());
+        //获取flink-sr逻辑表的schema
         rowTransformer.setTableSchema(schema);
         this.serializer = StarRocksSerializerFactory.createSerializer(sinkOptions, schema.getFieldNames());
         this.rowTransformer = rowTransformer;
@@ -104,12 +108,19 @@ public class StarRocksDynamicSinkFunction<T> extends StarRocksDynamicSinkFunctio
         }
         if (null == serializer) {
             if (value instanceof StarRocksSinkRowDataWithMeta) {
-                StarRocksSinkRowDataWithMeta data = (StarRocksSinkRowDataWithMeta)value;
+                StarRocksSinkRowDataWithMeta data = (StarRocksSinkRowDataWithMeta) value;
                 if (Strings.isNullOrEmpty(data.getDatabase()) || Strings.isNullOrEmpty(data.getTable()) || null == data.getDataRows()) {
                     LOG.warn(String.format("json row data not fullfilled. {database: %s, table: %s, dataRows: %s}", data.getDatabase(), data.getTable(), data.getDataRows()));
                     return;
                 }
                 sinkManager.writeRecords(data.getDatabase(), data.getTable(), data.getDataRows());
+                return;
+            }
+            if (value instanceof Tuple3) {
+                Tuple3 tuple3 = (Tuple3) value;
+                sinkManager.writeRecords(sinkOptions.getDatabaseName().concat("_").concat((String) tuple3._1()), sinkOptions.getTableName(), (String) tuple3._3());
+                totalInvokeRows.inc(1);
+                totalInvokeRowsTime.inc(System.nanoTime() - start);
                 return;
             }
             // raw data sink
@@ -146,18 +157,21 @@ public class StarRocksDynamicSinkFunction<T> extends StarRocksDynamicSinkFunctio
             }
         }
         if (value instanceof RowData) {
-            if (RowKind.UPDATE_BEFORE.equals(((RowData)value).getRowKind())) {
+            if (RowKind.UPDATE_BEFORE.equals(((RowData) value).getRowKind())) {
                 // do not need update_before, cauz an update action happened on the primary keys will be separated into `delete` and `create`
                 return;
             }
-            if (!sinkOptions.supportUpsertDelete() && RowKind.DELETE.equals(((RowData)value).getRowKind())) {
+            if (!sinkOptions.supportUpsertDelete() && RowKind.DELETE.equals(((RowData) value).getRowKind())) {
                 // let go the UPDATE_AFTER and INSERT rows for tables who have a group of `unique` or `duplicate` keys.
                 return;
             }
         }
+        assert value instanceof RowData;
+        // LOG.warn("当前库为："+( sinkOptions.getSinkDynamic() ? sinkOptions.getDatabaseName().concat("_").concat(((RowData) value).getString(1).toString()) : sinkOptions.getDatabaseName()));
         sinkManager.writeRecords(
-                sinkOptions.getDatabaseName(),
-                sinkOptions.getTableName(),
+                //是否开启动态写库表
+                sinkOptions.getSinkDynamicDB() ? sinkOptions.getDatabaseName().concat("_").concat(((RowData) value).getString(sinkOptions.getSinkDynamicDBIndex()).toString()) : sinkOptions.getDatabaseName(), //固定格式第二个值作为参数传进来
+                sinkOptions.getSinkDynamicTable() ? sinkOptions.getTableName().concat("_").concat(((RowData) value).getString(sinkOptions.getSinkDynamicTABLEIndex()).toString()) : sinkOptions.getTableName(),
                 serializer.serialize(rowTransformer.transform(value, sinkOptions.supportUpsertDelete()))
         );
         totalInvokeRows.inc(1);
@@ -172,7 +186,8 @@ public class StarRocksDynamicSinkFunction<T> extends StarRocksDynamicSinkFunctio
         ListStateDescriptor<Map<String, StarRocksSinkBufferEntity>> descriptor =
                 new ListStateDescriptor<>(
                         "buffered-rows",
-                        TypeInformation.of(new TypeHint<Map<String, StarRocksSinkBufferEntity>>(){})
+                        TypeInformation.of(new TypeHint<Map<String, StarRocksSinkBufferEntity>>() {
+                        })
                 );
         checkpointedState = context.getOperatorStateStore().getListState(descriptor);
     }
@@ -188,6 +203,8 @@ public class StarRocksDynamicSinkFunction<T> extends StarRocksDynamicSinkFunctio
         sinkManager.flush(null, true);
     }
 
+/*
+
     @Override
     public synchronized void finish() throws Exception {
         super.finish();
@@ -197,6 +214,7 @@ public class StarRocksDynamicSinkFunction<T> extends StarRocksDynamicSinkFunctio
         }
         sinkManager.flush(null, true);
     }
+*/
 
     @Override
     public synchronized void close() throws Exception {

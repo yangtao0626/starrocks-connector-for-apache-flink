@@ -19,7 +19,7 @@ limitations under the License.
 <module name="Checker">
     <module name="SuppressWarningsFilter"/>
     <module name="TreeWalker">
-        <module name="AvoidStarImport"/>
+       <!-- <module name="AvoidStarImport"/>-->
         <module name="UnusedImports"/>
     </module>
 </module>

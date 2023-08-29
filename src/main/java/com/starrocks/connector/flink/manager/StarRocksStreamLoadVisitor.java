@@ -82,19 +82,36 @@ public class StarRocksStreamLoadVisitor implements Serializable {
     }
 
     public Map<String, Object> doStreamLoad(StarRocksSinkBufferEntity bufferEntity) throws IOException {
-        String host = getAvailableHost();
+        String host = getAvailableHost(sinkOptions.getLoadUrlList());
         if (null == host) {
             throw new IOException("None of the hosts in `load_url` could be connected.");
         }
+
+        StarRocksSinkOptions.StarrocksConnectConfig connectConfig = new StarRocksSinkOptions.StarrocksConnectConfig();
+        connectConfig.setUsername(sinkOptions.getUsername());
+        connectConfig.setPassword(sinkOptions.getPassword());
+        return putData(bufferEntity, host, connectConfig);
+    }
+
+    public Map<String, Object> doStreamLoad(StarRocksSinkBufferEntity bufferEntity, StarRocksSinkOptions.StarrocksConnectConfig connectConfig) throws IOException {
+        String host = getAvailableHost(connectConfig.getLoadUrls());
+        if (null == host) {
+            throw new IOException("None of the hosts in `load_url` could be connected.");
+        }
+
+        return putData(bufferEntity, host, connectConfig);
+    }
+
+    private Map<String, Object> putData(StarRocksSinkBufferEntity bufferEntity, String host, StarRocksSinkOptions.StarrocksConnectConfig connectConfig) throws IOException {
         String loadUrl = new StringBuilder(host)
-            .append("/api/")
-            .append(bufferEntity.getDatabase())
-            .append("/")
-            .append(bufferEntity.getTable())
-            .append("/_stream_load")
-            .toString();
+                .append("/api/")
+                .append(connectConfig.getDatabase() != null ? connectConfig.getDatabase() : bufferEntity.getDatabase())
+                .append("/")
+                .append(connectConfig.getTable() != null ? connectConfig.getTable() : bufferEntity.getTable())
+                .append("/_stream_load")
+                .toString();
         LOG.info(String.format("Start to join batch data: label[%s].", bufferEntity.getLabel()));
-        Map<String, Object> loadResult = doHttpPut(loadUrl, bufferEntity.getLabel(), joinRows(bufferEntity.getBuffer(),  (int) bufferEntity.getBatchSize()));
+        Map<String, Object> loadResult = doHttpPut(connectConfig, loadUrl, bufferEntity.getLabel(), joinRows(bufferEntity.getBuffer(),  (int) bufferEntity.getBatchSize()));
         final String keyStatus = "Status";
         if (null == loadResult || !loadResult.containsKey(keyStatus)) {
             throw new IOException("Unable to flush data to StarRocks: unknown result status, usually caused by: 1.authorization or permission related problems. 2.Wrong column_separator or row_delimiter. 3.Column count exceeded the limitation.");
@@ -108,7 +125,7 @@ public class StarRocksStreamLoadVisitor implements Serializable {
                 logMap.put("streamLoadErrorLog", getErrorLog((String) loadResult.get("ErrorURL")));
             }
             throw new StarRocksStreamLoadFailedException(String.format("Failed to flush data to StarRocks, Error " +
-                "response: \n%s\n%s\n", JSON.toJSONString(loadResult), JSON.toJSONString(logMap)), loadResult);
+                    "response: \n%s\n%s\n", JSON.toJSONString(loadResult), JSON.toJSONString(logMap)), loadResult);
         } else if (RESULT_LABEL_EXISTED.equals(loadResult.get(keyStatus))) {
             LOG.error(String.format("Stream Load response: \n%s\n", JSON.toJSONString(loadResult)));
             // has to block-checking the state to get the final result
@@ -194,20 +211,14 @@ public class StarRocksStreamLoadVisitor implements Serializable {
         }
     }
 
-    private String getAvailableHost() {
-        List<String> hostList = sinkOptions.getLoadUrlList();
+    private String getAvailableHost(List<String> hostList) {
         long tmp = pos + hostList.size();
-        while (pos < tmp) {
-            String host = hostList.get((int) (pos % hostList.size()));
-            if (host != null && !host.startsWith("http")) {
-                host = "http://" + host;
-            }
-            pos++;
+        for (; pos < tmp; pos++) {
+            String host = new StringBuilder("http://").append(hostList.get((int) (pos % hostList.size()))).toString();
             if (tryHttpConnection(host)) {
                 return host;
             }
         }
-
         return null;
     }
 
@@ -255,15 +266,15 @@ public class StarRocksStreamLoadVisitor implements Serializable {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> doHttpPut(String loadUrl, String label, byte[] data) throws IOException {
+    private Map<String, Object> doHttpPut(StarRocksSinkOptions.StarrocksConnectConfig connectConfig, String loadUrl, String label, byte[] data) throws IOException {
         LOG.info(String.format("Executing stream load to: '%s', size: '%s', thread: %d", loadUrl, data.length, Thread.currentThread().getId()));
         final HttpClientBuilder httpClientBuilder = HttpClients.custom()
-            .setRedirectStrategy(new DefaultRedirectStrategy() {
-                @Override
-                protected boolean isRedirectable(String method) {
-                    return true;
-                }
-            });
+                .setRedirectStrategy(new DefaultRedirectStrategy() {
+                    @Override
+                    protected boolean isRedirectable(String method) {
+                        return true;
+                    }
+                });
         try (CloseableHttpClient httpclient = httpClientBuilder.build()) {
             HttpPut httpPut = new HttpPut(loadUrl);
             Map<String, String> props = sinkOptions.getSinkStreamLoadProperties();
@@ -282,7 +293,7 @@ public class StarRocksStreamLoadVisitor implements Serializable {
             }
             httpPut.setHeader("Expect", "100-continue");
             httpPut.setHeader("label", label);
-            httpPut.setHeader("Authorization", getBasicAuthHeader(sinkOptions.getUsername(), sinkOptions.getPassword()));
+            httpPut.setHeader("Authorization", getBasicAuthHeader(connectConfig.getUsername(), connectConfig.getPassword()));
             httpPut.setEntity(new ByteArrayEntity(data));
             httpPut.setConfig(RequestConfig.custom().setRedirectsEnabled(true).build());
             try (CloseableHttpResponse resp = httpclient.execute(httpPut)) {
@@ -293,7 +304,6 @@ public class StarRocksStreamLoadVisitor implements Serializable {
             }
         }
     }
-
     private String getBasicAuthHeader(String username, String password) {
         String auth = username + ":" + password;
         byte[] encodedAuth = Base64.encodeBase64(auth.getBytes(StandardCharsets.UTF_8));

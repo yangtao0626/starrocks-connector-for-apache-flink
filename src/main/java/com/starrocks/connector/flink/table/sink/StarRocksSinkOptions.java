@@ -14,6 +14,7 @@
 
 package com.starrocks.connector.flink.table.sink;
 
+import com.google.common.collect.Maps;
 import com.starrocks.connector.flink.manager.StarRocksSinkTable;
 import com.starrocks.connector.flink.row.sink.StarRocksDelimiterParser;
 import com.starrocks.data.load.stream.StreamLoadDataFormat;
@@ -36,6 +37,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.apache.http.protocol.HttpRequestExecutor.DEFAULT_WAIT_FOR_CONTINUE;
@@ -53,13 +56,23 @@ public class StarRocksSinkOptions implements Serializable {
         CSV, JSON;
     }
 
+
+    // multi cluster properties
+    private Pattern multiClusterPropPattern = Pattern.compile("multi.cluster.(\\S+)[.](\\S+)");
+    private Map<String, List<String>> multiClusterLoadUrls = Maps.newHashMap();
+    private Map<String, StarrocksConnectConfig> multiClusterProperties = Maps.newHashMap();
     private static final String FORMAT_KEY = "format";
 
     // required sink configurations
     public static final ConfigOption<String> JDBC_URL = ConfigOptions.key("jdbc-url")
-            .stringType().noDefaultValue().withDescription("Url of the jdbc like: `jdbc:mysql://fe_ip1:query_port,fe_ip2:query_port...`.");
+            .stringType()
+            .noDefaultValue()
+            .withDescription("Url of the jdbc like: `jdbc:mysql://fe_ip1:query_port,fe_ip2:query_port...`.");
     public static final ConfigOption<List<String>> LOAD_URL = ConfigOptions.key("load-url")
-            .stringType().asList().noDefaultValue().withDescription("Url of the stream load, if you you don't specify the http/https prefix, the default http. like: `fe_ip1:http_port;http://fe_ip2:http_port;https://fe_nlb`.");
+            .stringType()
+            .asList()
+            .noDefaultValue()
+            .withDescription("Url of the stream load, if you you don't specify the http/https prefix, the default http. like: `fe_ip1:http_port;http://fe_ip2:http_port;https://fe_nlb`.");
     public static final ConfigOption<String> DATABASE_NAME = ConfigOptions.key("database-name")
             .stringType().noDefaultValue().withDescription("Database name of the stream load.");
     public static final ConfigOption<String> TABLE_NAME = ConfigOptions.key("table-name")
@@ -69,8 +82,31 @@ public class StarRocksSinkOptions implements Serializable {
     public static final ConfigOption<String> PASSWORD = ConfigOptions.key("password")
             .stringType().noDefaultValue().withDescription("StarRocks user password.");
 
+
+    //动态写库 写表
+    public static final ConfigOption<Boolean> SINK_DYNAMIC_DATABASE = ConfigOptions.key("sink.dynamic.database")
+            .booleanType().defaultValue(false).withDescription("StarRocks sink dynamic database  ");
+    public static final ConfigOption<Boolean> SINK_DYNAMIC_TABLE = ConfigOptions.key("sink.dynamic.table")
+            .booleanType().defaultValue(false).withDescription("StarRocks sink dynamic  table ");
+    public static final ConfigOption<Integer> SINK_DYNAMIC_DATABASE_INDEX = ConfigOptions.key("sink.dynamic.database.index")
+            .intType().noDefaultValue().withDescription("StarRocks sink dynamic database field index  ");
+    public static final ConfigOption<Integer> SINK_DYNAMIC_TABLE_INDEX = ConfigOptions.key("sink.dynamic.table.index")
+            .intType().noDefaultValue().withDescription("StarRocks sink dynamic  table field index ");
+
+    //是否关闭meta校验
+    public static final ConfigOption<Boolean> SINK_VALIDATE_TABLE_SCHEMA_CLOSE = ConfigOptions.key("sink.validate.table.schema.close")
+            .booleanType().defaultValue(false).withDescription("StarRocks sink Validate table schema is or is not close");
+
+    // multi cluster operate
+    public static final ConfigOption<Boolean> MULTI_CLUSTER_OPEN = ConfigOptions.key("multi.cluster.open")
+            .booleanType().defaultValue(false).withDescription("Write multi StarRocks clusters at the same time.");
+    public static final ConfigOption<Map<String, String>> MULTI_CLUSTER_LIST_PROPERTIES = ConfigOptions.key("multi.cluster.list.properties")
+            .mapType().defaultValue(null).withDescription("Config multi follow StarRocks clusters properties.");
+    public static final ConfigOption<Boolean> IGNORE_MAIN_CLUSTER_FAIL = ConfigOptions.key("ignore.main.cluster.fail")
+            .booleanType().defaultValue(false).withDescription("Ignore fail in main cluster write operate.");
+
     // optional sink configurations
-    public static final ConfigOption<String > SINK_VERSION = ConfigOptions.key("sink.version")
+    public static final ConfigOption<String> SINK_VERSION = ConfigOptions.key("sink.version")
             .stringType()
             .defaultValue(SinkFunctionFactory.SinkVersion.AUTO.name())
             .withDescription("Version of the sink");
@@ -127,6 +163,7 @@ public class StarRocksSinkOptions implements Serializable {
         this.tableOptions = options;
         this.tableOptionsMap = optionsMap;
         parseSinkStreamLoadProperties();
+        parseMultiFollowClusterProperties();
         this.validate();
     }
 
@@ -170,6 +207,44 @@ public class StarRocksSinkOptions implements Serializable {
     public String getPassword() {
         return tableOptions.get(PASSWORD);
     }
+
+
+    public boolean getSinkDynamicDB() {
+        return tableOptions.getOptional(SINK_DYNAMIC_DATABASE).orElse(false);
+    }
+
+    public boolean getSinkDynamicTable() {
+        return tableOptions.getOptional(SINK_DYNAMIC_TABLE).orElse(false);
+    }
+
+    public Integer getSinkDynamicDBIndex() {
+        return tableOptions.get(SINK_DYNAMIC_DATABASE_INDEX);
+    }
+
+    public Integer getSinkDynamicTABLEIndex() {
+        return tableOptions.get(SINK_DYNAMIC_TABLE_INDEX);
+    }
+
+    public boolean isMultiClusterOpen() {
+        return tableOptions.getOptional(MULTI_CLUSTER_OPEN).orElse(false);
+    }
+
+    public Map<String, List<String>> getMultiClusterLoadUrls() {
+        return multiClusterLoadUrls;
+    }
+
+    public boolean getCloseTableSchemaValidate() {
+        return tableOptions.getOptional(SINK_VALIDATE_TABLE_SCHEMA_CLOSE).orElse(false);
+    }
+
+    public Map<String, StarrocksConnectConfig> getMultiClusterProperties() {
+        return multiClusterProperties;
+    }
+
+    public boolean ignoreMainClusterFail() {
+        return isMultiClusterOpen() && tableOptions.getOptional(IGNORE_MAIN_CLUSTER_FAIL).orElse(false);
+    }
+
 
     public String getSinkVersion() {
         return tableOptions.get(SINK_VERSION);
@@ -295,7 +370,7 @@ public class StarRocksSinkOptions implements Serializable {
 
     private void validateSinkSemantic() {
         tableOptions.getOptional(SINK_SEMANTIC).ifPresent(semantic -> {
-            if (!SINK_SEMANTIC_ENUMS.contains(semantic)){
+            if (!SINK_SEMANTIC_ENUMS.contains(semantic)) {
                 throw new ValidationException(
                         String.format("Unsupported value '%s' for '%s'. Supported values are ['at-least-once', 'exactly-once'].",
                                 semantic, SINK_SEMANTIC.key()));
@@ -372,11 +447,68 @@ public class StarRocksSinkOptions implements Serializable {
                 });
     }
 
+    private void parseMultiFollowClusterProperties() {
+        Map<String, String> props = tableOptions.getOptional(MULTI_CLUSTER_LIST_PROPERTIES).orElse(null);
+        if (props == null || props.isEmpty()) {
+            return;
+        }
+
+        props.keySet().forEach(key -> {
+            Matcher matcher = multiClusterPropPattern.matcher(key);
+            if (matcher.matches() == false) {
+                return;
+            }
+
+            String clusterName = matcher.group(1);
+            StarrocksConnectConfig connectConfig = multiClusterProperties.putIfAbsent(clusterName, new StarrocksConnectConfig());
+            if (connectConfig == null) {
+                connectConfig = multiClusterProperties.get(clusterName);
+                // 设置默认配置属性（使用主集群属性）
+                connectConfig.setUsername(getUsername());
+                connectConfig.setPassword(getPassword());
+                connectConfig.setDatabase(getDatabaseName());
+                connectConfig.setTable(getTableName());
+            }
+
+            // load-url
+            if (LOAD_URL.key().equals(matcher.group(2))) {
+                List<String> urls = Arrays.asList(props.get(key).split(";"));
+                connectConfig.setLoadUrls(urls);
+                multiClusterLoadUrls.put(clusterName, urls);
+            }
+
+            // username
+            if (USERNAME.key().equals(matcher.group(2))) {
+                String username = props.get(key);
+                connectConfig.setUsername(username);
+            }
+
+            // password
+            if (PASSWORD.key().equals(matcher.group(2))) {
+                String password = props.get(key);
+                connectConfig.setPassword(password);
+            }
+
+            // database
+            if (DATABASE_NAME.key().equals(matcher.group(2))) {
+                String database = props.get(key);
+                connectConfig.setDatabase(database);
+            }
+
+            // table
+            if (TABLE_NAME.key().equals(matcher.group(2))) {
+                String table = props.get(key);
+                connectConfig.setTable(table);
+            }
+        });
+    }
+
     /**
      * Builder for {@link StarRocksSinkOptions}.
      */
     public static final class Builder {
         private final Configuration conf;
+
         public Builder() {
             conf = new Configuration();
         }
@@ -462,4 +594,54 @@ public class StarRocksSinkOptions implements Serializable {
         return builder.build();
     }
 
+    public static final class StarrocksConnectConfig implements Serializable {
+        private static final long serialVersionUID = 7360412229501809384L;
+
+        private List<String> loadUrls;
+        private String username;
+        private String password;
+        private String database;
+        private String table;
+
+        public List<String> getLoadUrls() {
+            return loadUrls;
+        }
+
+        public void setLoadUrls(List<String> loadUrls) {
+            this.loadUrls = loadUrls;
+        }
+
+        public String getUsername() {
+            return username;
+        }
+
+        public void setUsername(String username) {
+            this.username = username;
+        }
+
+        public String getPassword() {
+            return password;
+        }
+
+        public void setPassword(String password) {
+            this.password = password;
+        }
+
+        public String getDatabase() {
+            return database;
+        }
+
+        public void setDatabase(String database) {
+            this.database = database;
+        }
+
+        public String getTable() {
+            return table;
+        }
+
+        public void setTable(String table) {
+            this.table = table;
+        }
+
+    }
 }

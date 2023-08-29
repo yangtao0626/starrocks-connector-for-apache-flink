@@ -131,7 +131,7 @@ public class StarRocksTableRowTransformer implements StarRocksIRowTransformer<Ro
             case CHAR:
             case VARCHAR:
                 String sValue = record.getString(pos).toString();
-                if (columns == null) {
+                if (columns == null || columns.isEmpty()) {
                     return sValue;
                 }
                 StarRocksDataType starRocksDataType =

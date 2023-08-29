@@ -25,24 +25,38 @@ import org.apache.flink.table.utils.TableSchemaUtils;
 import java.util.HashSet;
 import java.util.Set;
 
+/**
+ * 自定义sink工厂类入口，用于SPI发现
+ */
 public class StarRocksDynamicTableSinkFactory implements DynamicTableSinkFactory {
 
     @Override
     public DynamicTableSink createDynamicTableSink(Context context) {
         final FactoryUtil.TableFactoryHelper helper = FactoryUtil.createTableFactoryHelper(this, context);
         helper.validateExcept(StarRocksSinkOptions.SINK_PROPERTIES_PREFIX);
+
         ReadableConfig options = helper.getOptions();
         // validate some special properties
         StarRocksSinkOptions sinkOptions = new StarRocksSinkOptions(options, context.getCatalogTable().getOptions());
+
         TableSchema physicalSchema = TableSchemaUtils.getPhysicalSchema(context.getCatalogTable().getSchema());
+
         return new StarRocksDynamicTableSink(sinkOptions, physicalSchema);
     }
 
+    /**
+     * 用于 SPI发现时候，选用指定的实现，和'connector'='starrocks' 对应
+     * @return
+     */
     @Override
     public String factoryIdentifier() {
         return "starrocks";
     }
 
+    /**
+     * 必选参数
+     * @return
+     */
     @Override
     public Set<ConfigOption<?>> requiredOptions() {
         Set<ConfigOption<?>> requiredOptions = new HashSet<>();
@@ -55,6 +69,10 @@ public class StarRocksDynamicTableSinkFactory implements DynamicTableSinkFactory
         return requiredOptions;
     }
 
+    /**
+     * 可选参数
+     * @return
+     */
     @Override
     public Set<ConfigOption<?>> optionalOptions() {
         Set<ConfigOption<?>> optionalOptions = new HashSet<>();
@@ -72,6 +90,22 @@ public class StarRocksDynamicTableSinkFactory implements DynamicTableSinkFactory
         optionalOptions.add(StarRocksSinkOptions.SINK_IO_THREAD_COUNT);
         optionalOptions.add(StarRocksSinkOptions.SINK_CHUNK_LIMIT);
         optionalOptions.add(StarRocksSinkOptions.SINK_SCAN_FREQUENCY);
+
+        // multi follow cluster props
+        optionalOptions.add(StarRocksSinkOptions.MULTI_CLUSTER_OPEN);
+        optionalOptions.add(StarRocksSinkOptions.MULTI_CLUSTER_LIST_PROPERTIES);
+        optionalOptions.add(StarRocksSinkOptions.IGNORE_MAIN_CLUSTER_FAIL);
+
+        //是否动态落库表,默认false
+        optionalOptions.add(StarRocksSinkOptions.SINK_DYNAMIC_DATABASE);
+        optionalOptions.add(StarRocksSinkOptions.SINK_DYNAMIC_TABLE);
+        //动态落库表 依赖的字段在RowData的中位置,index从0开始
+        optionalOptions.add(StarRocksSinkOptions.SINK_DYNAMIC_DATABASE_INDEX);
+        optionalOptions.add(StarRocksSinkOptions.SINK_DYNAMIC_TABLE_INDEX);
+
+        //是否关闭schema校验,默认false
+        optionalOptions.add(StarRocksSinkOptions.SINK_VALIDATE_TABLE_SCHEMA_CLOSE);
+
         return optionalOptions;
     }
 }

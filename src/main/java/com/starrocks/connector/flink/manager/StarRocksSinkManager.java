@@ -22,11 +22,11 @@ import org.apache.flink.api.common.functions.RuntimeContext;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.Histogram;
 import org.apache.flink.runtime.metrics.DescriptiveStatisticsHistogram;
+import org.apache.flink.runtime.util.ExecutorThreadFactory;
 import org.apache.flink.table.api.TableColumn;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.api.constraints.UniqueConstraint;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
-import org.apache.flink.util.concurrent.ExecutorThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,12 +39,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 public class StarRocksSinkManager implements Serializable {
@@ -58,6 +55,8 @@ public class StarRocksSinkManager implements Serializable {
     private StarRocksStreamLoadVisitor starrocksStreamLoadVisitor;
     private final StarRocksSinkOptions sinkOptions;
     final LinkedBlockingDeque<StarRocksSinkBufferEntity> flushQueue = new LinkedBlockingDeque<>(1);
+
+    private StarRocksSinkOptions.StarrocksConnectConfig mainClusterConfig;
 
     private transient Counter totalFlushBytes;
     private transient Counter totalFlushRows;
@@ -82,7 +81,7 @@ public class StarRocksSinkManager implements Serializable {
     private static final String COUNTER_TOTAL_FLUSH_COST_TIME = "totalFlushTimeNs";
     private static final String COUNTER_TOTAL_FLUSH_SUCCEEDED_TIMES = "totalFlushSucceededTimes";
     private static final String COUNTER_TOTAL_FLUSH_FAILED_TIMES = "totalFlushFailedTimes";
-    private static final String HISTOGRAM_FLUSH_TIME= "flushTimeNs";
+    private static final String HISTOGRAM_FLUSH_TIME = "flushTimeNs";
     private static final String HISTOGRAM_OFFER_TIME_NS = "offerTimeNs";
 
     // from stream load result
@@ -101,6 +100,7 @@ public class StarRocksSinkManager implements Serializable {
 
     private ScheduledExecutorService scheduler;
     private ScheduledFuture<?> scheduledFuture;
+    private transient ExecutorService multiClusterThreadPool;
 
     private transient long startTimeNano;
 
@@ -126,13 +126,34 @@ public class StarRocksSinkManager implements Serializable {
 
 
     protected void init(TableSchema schema) {
-        validateTableStructure(schema);
+        //如果关闭了校验，就不检查表结构
+        if (!sinkOptions.getCloseTableSchemaValidate()) {
+
+            validateTableStructure(schema);
+        }
         String version = starrocksQueryVisitor.getStarRocksVersion();
         this.starrocksStreamLoadVisitor = new StarRocksStreamLoadVisitor(
                 sinkOptions,
                 null == schema ? new String[]{} : schema.getFieldNames(),
                 version.length() > 0 && !version.trim().startsWith("1.")
         );
+
+        this.mainClusterConfig = new StarRocksSinkOptions.StarrocksConnectConfig();
+        this.mainClusterConfig.setLoadUrls(sinkOptions.getLoadUrlList());
+        this.mainClusterConfig.setUsername(sinkOptions.getUsername());
+        this.mainClusterConfig.setPassword(sinkOptions.getPassword());
+
+        // multi starrocks cluster
+        if (sinkOptions.isMultiClusterOpen()) {
+            initMultiFollowClusterThreadPool();
+        }
+    }
+
+    private void initMultiFollowClusterThreadPool() {
+        if (this.multiClusterThreadPool == null) {
+            int followClusterNum = sinkOptions.getMultiClusterProperties().keySet().size();
+            this.multiClusterThreadPool = Executors.newScheduledThreadPool(2, new ExecutorThreadFactory("multi-follow-starrocks-clusters-interval-sink"));
+        }
     }
 
     public void setRuntimeContext(RuntimeContext runtimeCtx) {
@@ -274,6 +295,12 @@ public class StarRocksSinkManager implements Serializable {
                 scheduledFuture.cancel(false);
                 scheduler.shutdown();
             }
+
+            if (this.multiClusterThreadPool != null) {
+                this.multiClusterThreadPool.shutdown();
+            }
+
+
             if (jdbcConnProvider != null) {
                 jdbcConnProvider.close();
             }
@@ -309,16 +336,73 @@ public class StarRocksSinkManager implements Serializable {
             return false;
         }
         stopScheduler();
-        LOG.info(String.format("Async stream load: db[%s] table[%s] rows[%d] bytes[%d] label[%s].", flushData.getDatabase(), flushData.getTable(), flushData.getBatchCount(), flushData.getBatchSize(), flushData.getLabel()));
+
+
+        // start flush to follow clusters execute task
+        List<Future<Map<String, Object>>> followClusterResults = new ArrayList();
+        if (sinkOptions.isMultiClusterOpen()) {
+            Map<String, StarRocksSinkOptions.StarrocksConnectConfig> multiClusterProperties = sinkOptions.getMultiClusterProperties();
+            if (this.multiClusterThreadPool == null) {
+                initMultiFollowClusterThreadPool();
+            }
+
+            multiClusterProperties.keySet().forEach(clusterName -> {
+                StarRocksSinkOptions.StarrocksConnectConfig connectConfig = multiClusterProperties.get(clusterName);
+                followClusterResults.add(multiClusterThreadPool.submit(() -> flushStarRocks(flushData, clusterName, connectConfig, false)));
+            });
+        }
+
+        // flush to main cluster
+        flushStarRocks(flushData, "MainCluster", this.mainClusterConfig, true);
+
+        // check multi follow cluster data same with main cluster
+        checkDataWithSame(followClusterResults);
+        return true;
+    }
+
+    private void checkDataWithSame(List<Future<Map<String, Object>>> followClusterResults) {
+        if (followClusterResults == null || followClusterResults.isEmpty()) {
+            return;
+        }
+
+        AtomicReference<Integer> num = new AtomicReference<>(0);
+        AtomicReference<Exception> existError = null;
+        followClusterResults.forEach(feature -> {
+            try {
+                feature.get(5, TimeUnit.MINUTES);
+                num.getAndSet(num.get() + 1);
+            } catch (InterruptedException | TimeoutException e) {
+                existError.set(e);
+                LOG.error("", e);
+            } catch (ExecutionException e) {
+                existError.set(e);
+                LOG.error("", e);
+            }
+        });
+
+        if (followClusterResults.size() != num.get()) {
+            throw new RuntimeException("Attention!! Follow clusters data wouldn't be able to same with main cluster", existError.get());
+        }
+    }
+
+    private Map<String, Object> flushStarRocks(StarRocksSinkBufferEntity flushData, String clusterName,
+                                               StarRocksSinkOptions.StarrocksConnectConfig connectConfig, boolean isMainCluster) throws IOException {
+        LOG.info(String.format("Async stream load: clusterName[%s] db[%s] table[%s] rows[%d] bytes[%d] label[%s].",
+                clusterName, flushData.getDatabase(), flushData.getTable(), flushData.getBatchCount(),
+                flushData.getBatchSize(), flushData.getLabel()));
+        Map<String, Object> result = null;
         long startWithRetries = System.nanoTime();
         for (int i = 0; i <= sinkOptions.getSinkMaxRetries(); i++) {
             try {
                 long start = System.nanoTime();
                 // flush to StarRocks with stream load
-                Map<String, Object> result = starrocksStreamLoadVisitor.doStreamLoad(flushData);
-                LOG.info(String.format("Async stream load finished: label[%s].", flushData.getLabel()));
+                result = starrocksStreamLoadVisitor.doStreamLoad(flushData, connectConfig);
+                long now = System.nanoTime();
+                LOG.info(String.format("Async stream load finished: clusterName[%s] label[%s] cost[%d] totalCost[%d] totalCostTimes[%d].",
+                        clusterName, flushData.getLabel(), now - start, now - startWithRetries, i + 1));
+
                 // metrics
-                if (null != totalFlushBytes) {
+                if (isMainCluster && null != totalFlushBytes) {
                     totalFlushBytes.inc(flushData.getBatchSize());
                     totalFlushRows.inc(flushData.getBatchCount());
                     totalFlushTime.inc(System.nanoTime() - startWithRetries);
@@ -330,27 +414,32 @@ public class StarRocksSinkManager implements Serializable {
                 startScheduler();
                 break;
             } catch (Exception e) {
-                if (totalFlushFailedTimes != null) {
+                if (isMainCluster && totalFlushFailedTimes != null) {
                     totalFlushFailedTimes.inc();
                 }
-                LOG.warn("Failed to flush batch data to StarRocks, retry times = {}", i, e);
+                LOG.warn("Failed to flush batch data to clusterName[%s] StarRocks, retry times = {}", clusterName, i + 1, e);
                 if (i >= sinkOptions.getSinkMaxRetries()) {
                     throw e;
                 }
-                if (e instanceof StarRocksStreamLoadFailedException && ((StarRocksStreamLoadFailedException)e).needReCreateLabel()) {
+
+                if (e instanceof StarRocksStreamLoadFailedException && ((StarRocksStreamLoadFailedException) e).needReCreateLabel()) {
                     String oldLabel = flushData.getLabel();
                     flushData.reGenerateLabel();
-                    LOG.warn(String.format("Batch label changed from [%s] to [%s]", oldLabel, flushData.getLabel()));
+                    LOG.warn(String.format("clusterName[%s] Batch label changed from [%s] to [%s]",
+                            clusterName, oldLabel, flushData.getLabel()));
                 }
+
                 try {
                     Thread.sleep(1000l * Math.min(i + 1, 10));
                 } catch (InterruptedException ex) {
                     Thread.currentThread().interrupt();
-                    throw new IOException("Unable to flush, interrupted while doing another attempt", e);
+                    throw new IOException(String.format("Unable to flush clusterName[%s], interrupted while doing another attempt",
+                            clusterName), e);
                 }
             }
         }
-        return true;
+
+        return result;
     }
 
     private void waitAsyncFlushingDone() throws InterruptedException {
@@ -360,7 +449,7 @@ public class StarRocksSinkManager implements Serializable {
         checkFlushException();
     }
 
-    void offer(StarRocksSinkBufferEntity bufferEntity) throws InterruptedException{
+    void offer(StarRocksSinkBufferEntity bufferEntity) throws InterruptedException {
         if (!flushThreadAlive) {
             LOG.info(String.format("Flush thread already exit, ignore offer request for label[%s]", bufferEntity.getLabel()));
             return;
@@ -369,8 +458,8 @@ public class StarRocksSinkManager implements Serializable {
         long start = System.nanoTime();
         if (!flushQueue.offer(bufferEntity, sinkOptions.getSinkOfferTimeout(), TimeUnit.MILLISECONDS)) {
             throw new RuntimeException(
-                "Timeout while offering data to flushQueue, exceed " + sinkOptions.getSinkOfferTimeout() + " ms, see " +
-                    StarRocksSinkOptions.SINK_BATCH_OFFER_TIMEOUT.key());
+                    "Timeout while offering data to flushQueue, exceed " + sinkOptions.getSinkOfferTimeout() + " ms, see " +
+                            StarRocksSinkOptions.SINK_BATCH_OFFER_TIMEOUT.key());
         }
         long offerTime = System.nanoTime() - start;
         LOG.debug("Offer wait time {} nanos", offerTime);
@@ -420,7 +509,7 @@ public class StarRocksSinkManager implements Serializable {
                 throw new IllegalArgumentException("Primary keys not defined in the sink `TableSchema`.");
             }
             if (constraint.get().getColumns().size() != primayKeys.size() ||
-                !constraint.get().getColumns().stream().allMatch(col -> primayKeys.contains(col.toLowerCase()))) {
+                    !constraint.get().getColumns().stream().allMatch(col -> primayKeys.contains(col.toLowerCase()))) {
                 throw new IllegalArgumentException("Primary keys of the flink `TableSchema` do not match with the ones from starrocks table.");
             }
             sinkOptions.enableUpsertDelete();
@@ -430,19 +519,19 @@ public class StarRocksSinkManager implements Serializable {
             return;
         }
         if (flinkSchema.getFieldCount() != rows.size()) {
-            throw new IllegalArgumentException("Fields count of "+this.sinkOptions.getTableName()+" mismatch. \nflinkSchema["
-                    +flinkSchema.getFieldNames().length+"]:"
-                    +Arrays.asList( flinkSchema.getFieldNames()).stream().collect(Collectors.joining(","))
-                    +"\n realTab["+rows.size()+"]:"
-                    +rows.stream().map((r)-> String.valueOf(r.get("COLUMN_NAME"))).collect(Collectors.joining(",")));
+            throw new IllegalArgumentException("Fields count of " + this.sinkOptions.getTableName() + " mismatch. \nflinkSchema["
+                    + flinkSchema.getFieldNames().length + "]:"
+                    + Arrays.asList(flinkSchema.getFieldNames()).stream().collect(Collectors.joining(","))
+                    + "\n realTab[" + rows.size() + "]:"
+                    + rows.stream().map((r) -> String.valueOf(r.get("COLUMN_NAME"))).collect(Collectors.joining(",")));
         }
         List<TableColumn> flinkCols = flinkSchema.getTableColumns();
         for (int i = 0; i < rows.size(); i++) {
             String starrocksField = rows.get(i).get("COLUMN_NAME").toString().toLowerCase();
             String starrocksType = rows.get(i).get("DATA_TYPE").toString().toLowerCase();
             List<TableColumn> matchedFlinkCols = flinkCols.stream()
-                .filter(col -> col.getName().toLowerCase().equals(starrocksField) && (!typesMap.containsKey(starrocksType) || typesMap.get(starrocksType).contains(col.getType().getLogicalType().getTypeRoot())))
-                .collect(Collectors.toList());
+                    .filter(col -> col.getName().toLowerCase().equals(starrocksField) && (!typesMap.containsKey(starrocksType) || typesMap.get(starrocksType).contains(col.getType().getLogicalType().getTypeRoot())))
+                    .collect(Collectors.toList());
             if (matchedFlinkCols.isEmpty()) {
                 throw new IllegalArgumentException("Fields name or type mismatch for:" + starrocksField);
             }
